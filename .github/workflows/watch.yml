@@ -1,0 +1,41 @@
+name: CGV 판교 디스클로저 데이 예매 오픈 감시
+
+on:
+  schedule:
+    # 5분마다 (GitHub Actions 최소 주기; 부하 시 다소 지연될 수 있음)
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}  # 수동 실행 허용
+
+permissions:
+  contents: write  # state.json 커밋용 (기본 GITHUB_TOKEN 사용)
+
+concurrency:
+  group: cgv-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 예매 오픈 체크
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python check.py
+
+      - name: 상태 변경 시 커밋
+        run: |
+          if ! git diff --quiet -- state.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "chore: update alert state"
+            git push
+          else
+            echo "state.json 변경 없음."
+          fi
