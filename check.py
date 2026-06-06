@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""판교 CGV '디스클로저 데이' 예매 오픈 감시기.
+"""판교 CGV '디스클로저 데이' 새 회차 감시기.
 
 네이버 플레이스의 CGV 판교 극장 상영시간표 페이지를 가져와서,
-대상 영화(movNo)의 특정 날짜(scnYmd) 예매 회차가 등장하면
-Discord 웹훅으로 알림을 보낸다. 날짜별로 한 번만 알린다.
+대상 영화(movNo)의 감시 날짜에 새 회차(상영 시작시각)가 생기면
+Discord 웹훅으로 그 시각들을 알린다. 이미 본 시각은 재알림하지 않는다.
 
 CGV 본 사이트는 Cloudflare 봇 차단이 강해 헤드리스/데이터센터 IP로는
 접근이 막히지만, 네이버 플레이스는 CGV가 공개한 스케줄을 미러링하며
@@ -19,13 +19,11 @@ import urllib.error
 # ── 설정 ───────────────────────────────────────────────
 # 네이버 플레이스 'CGV 판교' 극장 상영시간표 페이지
 THEATER_URL = "https://m.place.naver.com/theater/37026678/movie"
-MOV_NO = "30001188"          # 디스클로저 데이 (CGV movNo) — 예매 회차 매칭용
-MOVIE_CODE = "252458"        # 디스클로저 데이 (네이버 movieCode) — 라인업 등재 매칭용
+MOV_NO = "30001188"          # 디스클로저 데이 (CGV movNo)
 SITE_NO = "0181"             # 판교 (CGV siteNo)
 MOVIE_NAME = "디스클로저 데이"
 THEATER_NAME = "판교 CGV"
-# 감시할 상영일 (YYYYMMDD).
-# 두 단계로 감지: (1) 라인업 등재(상영 예정 추가) (2) 실제 예매 회차 오픈.
+# 감시할 상영일 (YYYYMMDD). 해당 날짜에 새 회차(시간대)가 생기면 알린다.
 WATCH_DATES = ["20260612", "20260613"]
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -54,40 +52,20 @@ def showtimes_for(html, ymd):
     return set(pattern.findall(html))
 
 
-def listed_dates(html):
-    """대상 영화가 '상영 라인업(MovieTime)'에 등재된 상영일(YYYYMMDD) 집합.
-    예매 회차보다 먼저 뜨는 경우가 있어 예매 임박 신호로 쓴다.
-    네이버 데이터의 date는 'YYYY-MM-DD' 형식이라 YYYYMMDD로 변환한다."""
-    dashed = set()
-    # movieCode 기반 (필드 순서: movieCode, date, name)
-    dashed |= set(re.findall(
-        r'"movieCode":"' + re.escape(MOVIE_CODE) + r'","date":"(\d{4}-\d{2}-\d{2})"', html))
-    # 영화 이름 기반 (백업)
-    dashed |= set(re.findall(
-        r'"date":"(\d{4}-\d{2}-\d{2})","name":"' + re.escape(MOVIE_NAME) + r'"', html))
-    return {d.replace("-", "") for d in dashed}
-
-
 def load_state():
+    """날짜별로 지금까지 본 회차 시각 집합을 반환."""
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        return {
-            "listed": set(data.get("listed", [])),
-            # 날짜별로 지금까지 본 회차 시각 집합
-            "showtimes": {k: set(v) for k, v in data.get("showtimes", {}).items()},
-        }
+        return {k: set(v) for k, v in data.get("showtimes", {}).items()}
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"listed": set(), "showtimes": {}}
+        return {}
 
 
-def save_state(state):
+def save_state(showtimes):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "listed": sorted(state["listed"]),
-                "showtimes": {k: sorted(v) for k, v in state["showtimes"].items()},
-            },
+            {"showtimes": {k: sorted(v) for k, v in showtimes.items()}},
             f, ensure_ascii=False, indent=2,
         )
         f.write("\n")
@@ -132,51 +110,33 @@ def main():
               file=sys.stderr)
         return 1
 
-    listing = listed_dates(html)
-    state = load_state()
+    seen = load_state()
     sent = 0
 
     for ymd in WATCH_DATES:
         cur_times = showtimes_for(html, ymd)
-        seen_times = state["showtimes"].get(ymd, set())
+        seen_times = seen.get(ymd, set())
         new_times = cur_times - seen_times
         d = fmt_date(ymd)
-        print(f"[info] {MOVIE_NAME} {d}: 등재={ymd in listing} "
-              f"회차(현재)={sorted(cur_times) or '없음'} 신규={sorted(new_times) or '없음'}")
+        print(f"[info] {MOVIE_NAME} {d}: 회차(현재)={sorted(cur_times) or '없음'} "
+              f"신규={sorted(new_times) or '없음'}")
 
-        # 회차(시간대) 변화 — 핵심 알림.
+        # 새 회차(시간대)가 생겼을 때만 알린다.
         if new_times:
             times_str = ", ".join(sorted(new_times))
-            if not seen_times:
-                # 그 날짜에 처음으로 회차가 열림
-                msg = (f"🎬 **{THEATER_NAME} '{MOVIE_NAME}' {d} 예매 오픈!** "
-                       f"({len(new_times)}개 회차: {times_str})\n바로 예매: {THEATER_URL}")
-            else:
-                # 기존 외에 새 시간대가 추가됨
-                msg = (f"➕ **{THEATER_NAME} '{MOVIE_NAME}' {d} 새 회차 추가!** "
-                       f"({times_str})\n바로 예매: {THEATER_URL}")
-            send_discord(webhook, msg)
-            state["showtimes"][ymd] = seen_times | cur_times  # 합집합 보관(재등장 재알림 방지)
-            state["listed"].add(ymd)  # 회차가 떴으면 등재 알림은 생략
-            sent += 1
-            print(f"[alert] {ymd} 회차 알림 전송: {times_str}")
-            continue
-
-        # 회차는 아직 없지만 라인업 등재됨 — 예매 임박 조기 알림. 날짜별 1회.
-        if ymd in listing and ymd not in state["listed"]:
             send_discord(
                 webhook,
-                f"📋 **{THEATER_NAME} '{MOVIE_NAME}' {d} 상영 라인업 등재!** "
-                f"(예매 임박 — 곧 회차가 열립니다)\n확인: {THEATER_URL}",
+                f"🎬 **{THEATER_NAME} '{MOVIE_NAME}' {d} 새 회차!** ({times_str})\n"
+                f"바로 예매: {THEATER_URL}",
             )
-            state["listed"].add(ymd)
+            seen[ymd] = seen_times | cur_times  # 합집합 보관(재등장 재알림 방지)
             sent += 1
-            print(f"[alert] {ymd} 라인업 등재 알림 전송.")
+            print(f"[alert] {ymd} 새 회차 알림 전송: {times_str}")
 
     if sent:
-        save_state(state)
+        save_state(seen)
     else:
-        print("[info] 새 알림 없음.")
+        print("[info] 새 회차 없음.")
     return 0
 
 
