@@ -44,10 +44,12 @@ def fetch_html(url):
         return resp.read().decode("utf-8", "replace")
 
 
-def bookable_dates(html):
-    """대상 영화·판교의 '실제 예매 회차'가 있는 상영일(YYYYMMDD) 집합."""
+def showtimes_for(html, ymd):
+    """대상 영화·판교·해당 날짜의 예매 회차 시작시각(HH:MM) 집합.
+    ScheduleInfo의 ticketPcUrl(영화·날짜·극장 일치) 값 종료 직후 rtime을 매칭."""
     pattern = re.compile(
-        r"movNo=" + re.escape(MOV_NO) + r"&scnYmd=(\d{8})&siteNo=" + re.escape(SITE_NO)
+        r"movNo=" + re.escape(MOV_NO) + r"&scnYmd=" + re.escape(ymd) +
+        r"&siteNo=" + re.escape(SITE_NO) + r'[^"]*","rtime":"(\d{1,2}:\d{2})"'
     )
     return set(pattern.findall(html))
 
@@ -72,16 +74,20 @@ def load_state():
             data = json.load(f)
         return {
             "listed": set(data.get("listed", [])),
-            "bookable": set(data.get("bookable", [])),
+            # 날짜별로 지금까지 본 회차 시각 집합
+            "showtimes": {k: set(v) for k, v in data.get("showtimes", {}).items()},
         }
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"listed": set(), "bookable": set()}
+        return {"listed": set(), "showtimes": {}}
 
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"listed": sorted(state["listed"]), "bookable": sorted(state["bookable"])},
+            {
+                "listed": sorted(state["listed"]),
+                "showtimes": {k: sorted(v) for k, v in state["showtimes"].items()},
+            },
             f, ensure_ascii=False, indent=2,
         )
         f.write("\n")
@@ -126,38 +132,42 @@ def main():
               file=sys.stderr)
         return 1
 
-    booking = bookable_dates(html)
     listing = listed_dates(html)
-    print(f"[info] {MOVIE_NAME} @{THEATER_NAME} 라인업 등재: {sorted(listing) or '없음'} "
-          f"/ 예매가능: {sorted(booking) or '없음'}")
-
     state = load_state()
     sent = 0
 
     for ymd in WATCH_DATES:
-        is_listed = ymd in listing
-        is_bookable = ymd in booking
+        cur_times = showtimes_for(html, ymd)
+        seen_times = state["showtimes"].get(ymd, set())
+        new_times = cur_times - seen_times
+        d = fmt_date(ymd)
+        print(f"[info] {MOVIE_NAME} {d}: 등재={ymd in listing} "
+              f"회차(현재)={sorted(cur_times) or '없음'} 신규={sorted(new_times) or '없음'}")
 
-        # (2) 실제 예매 가능 — 가장 중요한 알림. 날짜별 1회.
-        if is_bookable and ymd not in state["bookable"]:
-            send_discord(
-                webhook,
-                f"🎬 **{THEATER_NAME} '{MOVIE_NAME}' {fmt_date(ymd)} 예매 가능!**\n"
-                f"바로 예매: {THEATER_URL}",
-            )
-            state["bookable"].add(ymd)
-            state["listed"].add(ymd)  # 예매 가능하면 등재 알림은 생략
+        # 회차(시간대) 변화 — 핵심 알림.
+        if new_times:
+            times_str = ", ".join(sorted(new_times))
+            if not seen_times:
+                # 그 날짜에 처음으로 회차가 열림
+                msg = (f"🎬 **{THEATER_NAME} '{MOVIE_NAME}' {d} 예매 오픈!** "
+                       f"({len(new_times)}개 회차: {times_str})\n바로 예매: {THEATER_URL}")
+            else:
+                # 기존 외에 새 시간대가 추가됨
+                msg = (f"➕ **{THEATER_NAME} '{MOVIE_NAME}' {d} 새 회차 추가!** "
+                       f"({times_str})\n바로 예매: {THEATER_URL}")
+            send_discord(webhook, msg)
+            state["showtimes"][ymd] = seen_times | cur_times  # 합집합 보관(재등장 재알림 방지)
+            state["listed"].add(ymd)  # 회차가 떴으면 등재 알림은 생략
             sent += 1
-            print(f"[alert] {ymd} 예매가능 알림 전송.")
+            print(f"[alert] {ymd} 회차 알림 전송: {times_str}")
             continue
 
-        # (1) 라인업 등재 — 예매 임박 조기 알림. 날짜별 1회.
-        if is_listed and ymd not in state["listed"]:
+        # 회차는 아직 없지만 라인업 등재됨 — 예매 임박 조기 알림. 날짜별 1회.
+        if ymd in listing and ymd not in state["listed"]:
             send_discord(
                 webhook,
-                f"📋 **{THEATER_NAME} '{MOVIE_NAME}' {fmt_date(ymd)} 상영 라인업 등재!** "
-                f"(예매 임박 — 곧 회차가 열립니다)\n"
-                f"확인: {THEATER_URL}",
+                f"📋 **{THEATER_NAME} '{MOVIE_NAME}' {d} 상영 라인업 등재!** "
+                f"(예매 임박 — 곧 회차가 열립니다)\n확인: {THEATER_URL}",
             )
             state["listed"].add(ymd)
             sent += 1
